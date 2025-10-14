@@ -464,33 +464,69 @@ void *alias_worker(void *arg) {
     AliasThreadData *data = (AliasThreadData *)arg;
     const uint64_t TEST_PATTERN = 0xDEADBEEFCAFEBABE;
 
-    for (size_t i = data->start_index; i < data->end_index; i++) {
-        // Validate before using
-        if (validate_address(mem_blocks[i].addr, PAGE_SIZE) != ADDR_VALID) {
+    for (size_t i = data->start_index; i < data->end_index && i < block_count; i++) {
+        // 範囲チェック
+        if (i >= block_count) {
+            break;
+        }
+        
+        // インデックスiの検証
+        AddressValidation val_i = validate_address(mem_blocks[i].addr, PAGE_SIZE);
+        if (val_i != ADDR_VALID) {
             continue;
         }
         
-        uint64_t *ptr_i = (uint64_t *)mem_blocks[i].addr;
-        uint64_t original_value_i = *ptr_i;
-        *ptr_i = TEST_PATTERN;
-
-        for (size_t j = i + 1; j < block_count; j++) {
-            if (validate_address(mem_blocks[j].addr, PAGE_SIZE) != ADDR_VALID) {
-                continue;
+        // より安全なポインタアクセス
+        volatile uint64_t *ptr_i = NULL;
+        struct sigaction sa, old_sa;
+        sa.sa_handler = segv_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        
+        if (sigaction(SIGSEGV, &sa, &old_sa) == -1) {
+            continue;
+        }
+        
+        segv_occurred = 0;
+        
+        if (sigsetjmp(segv_jmp_buf, 1) == 0) {
+            ptr_i = (volatile uint64_t *)mem_blocks[i].addr;
+            uint64_t original_value_i = *ptr_i;
+            *ptr_i = TEST_PATTERN;
+            
+            // 内側のループも保護
+            for (size_t j = i + 1; j < block_count; j++) {
+                if (j >= block_count) break;
+                
+                AddressValidation val_j = validate_address(mem_blocks[j].addr, PAGE_SIZE);
+                if (val_j != ADDR_VALID) {
+                    continue;
+                }
+                
+                volatile uint64_t *ptr_j = (volatile uint64_t *)mem_blocks[j].addr;
+                
+                // セグフォルト保護付きで読み取り
+                segv_occurred = 0;
+                if (sigsetjmp(segv_jmp_buf, 1) == 0) {
+                    if (*ptr_j == TEST_PATTERN) {
+                        pthread_mutex_lock(&g_alias_mutex);
+                        g_pairs_found++;
+                        printf("Alias detected: Page %zu (%p) <-> Page %zu (%p)\n",
+                               i, mem_blocks[i].addr, j, mem_blocks[j].addr);
+                        pthread_mutex_unlock(&g_alias_mutex);
+                    }
+                } else {
+                    // セグフォルト発生、スキップ
+                }
             }
             
-            uint64_t *ptr_j = (uint64_t *)mem_blocks[j].addr;
-            if (*ptr_j == TEST_PATTERN) {
-                pthread_mutex_lock(&g_alias_mutex);
-                
-                g_pairs_found++;
-                printf("Alias detected: Page %zu (%p) <-> Page %zu (%p)\n",
-                       i, mem_blocks[i].addr, j, mem_blocks[j].addr);
-                
-                pthread_mutex_unlock(&g_alias_mutex);
-            }
+            // 元の値を復元
+            *ptr_i = original_value_i;
+        } else {
+            // セグフォルト発生
         }
-        *ptr_i = original_value_i;
+        
+        sigaction(SIGSEGV, &old_sa, NULL);
     }
     return NULL;
 }
