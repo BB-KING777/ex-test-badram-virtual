@@ -472,21 +472,53 @@ void scan_all_processes_parallel(MappingTable *table) {
 }
 
 
+
 void *alias_worker_v2(void *arg) {
     AliasThreadDataV2 *data = (AliasThreadDataV2 *)arg;
     
-    // 複数のテストパターン
+    // スタック保護用のカナリア値
+    const uint64_t STACK_CANARY = 0xDEADBEEFDEADBEEF;
+    volatile uint64_t canary_start = STACK_CANARY;
+    
     const uint64_t PATTERN_1 = 0xDEADBEEFCAFEBABE;
     const uint64_t PATTERN_2 = 0x0123456789ABCDEF;
     const uint64_t PATTERN_3 = 0xFEDCBA9876543210;
 
-    // valid_indicesを使って有効なページのみスキャン
+    // シグナルハンドラのセットアップ
+    struct sigaction sa, old_sa;
+    sa.sa_handler = segv_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_NODEFER; // 重要: 再入可能にする
+    
+    if (sigaction(SIGSEGV, &sa, &old_sa) == -1) {
+        return NULL;
+    }
+
     for (size_t idx_i = data->start_index; idx_i < data->end_index; idx_i++) {
+        // カナリアチェック
+        if (canary_start != STACK_CANARY) {
+            pthread_mutex_lock(&g_print_mutex);
+            printf("\n!!! Stack corruption detected in thread !!!\n");
+            pthread_mutex_unlock(&g_print_mutex);
+            break;
+        }
+        
+        // 境界チェック (最重要)
+        if (idx_i >= data->valid_count) {
+            break;
+        }
+        
         size_t i = data->valid_indices[idx_i];
+        
+        // 二重境界チェック
+        if (i >= block_count) {
+            __sync_fetch_and_add(&g_alias_processed, 1);
+            continue;
+        }
         
         void *addr_i = mem_blocks[i].addr;
         
-        // 基本チェック
+        // NULL/範囲チェック
         if (addr_i == NULL) {
             __sync_fetch_and_add(&g_alias_processed, 1);
             continue;
@@ -498,37 +530,39 @@ void *alias_worker_v2(void *arg) {
             continue;
         }
         
-        // シグナルハンドラ設定
-        struct sigaction sa, old_sa;
-        sa.sa_handler = segv_handler;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;
-        
-        if (sigaction(SIGSEGV, &sa, &old_sa) == -1) {
-            __sync_fetch_and_add(&g_alias_processed, 1);
-            continue;
-        }
-        
         segv_occurred = 0;
         
         if (sigsetjmp(segv_jmp_buf, 1) == 0) {
             volatile uint64_t *ptr_i = (volatile uint64_t *)addr_i;
             
-            // 元の値を保存
+            // 読み取りテスト
+            volatile uint64_t test_read = *ptr_i;
+            (void)test_read;
+            
             uint64_t original_value_i = *ptr_i;
             
-            // ========================================
-            // フェーズ1: ページiにPATTERN_1を書き込み
-            // ========================================
+            // パターン1書き込み
             *ptr_i = PATTERN_1;
-            
-            // キャッシュフラッシュ（重要！）
             __builtin___clear_cache((char*)addr_i, (char*)addr_i + sizeof(uint64_t));
             asm volatile("mfence" ::: "memory");
             
-            // 内側のループ
+            // 内側ループ
             for (size_t idx_j = idx_i + 1; idx_j < data->valid_count; idx_j++) {
+                // カナリアチェック (内側ループでも)
+                if (canary_start != STACK_CANARY) {
+                    goto restore_i;
+                }
+                
+                // 境界チェック
+                if (idx_j >= data->valid_count) {
+                    break;
+                }
+                
                 size_t j = data->valid_indices[idx_j];
+                
+                if (j >= block_count) {
+                    continue;
+                }
                 
                 void *addr_j = mem_blocks[j].addr;
                 
@@ -544,27 +578,20 @@ void *alias_worker_v2(void *arg) {
                 segv_occurred = 0;
                 if (sigsetjmp(segv_jmp_buf, 1) == 0) {
                     
-                    // キャッシュフラッシュ
                     __builtin___clear_cache((char*)addr_j, (char*)addr_j + sizeof(uint64_t));
                     asm volatile("mfence" ::: "memory");
                     
-                    // ========================================
-                    // テスト1: ページjがPATTERN_1を持っているか？
-                    // ========================================
+                    // テスト1
                     uint64_t value_j_1 = *ptr_j;
-                    
                     if (value_j_1 != PATTERN_1) {
                         continue;
                     }
                     
-                    // ========================================
-                    // テスト2: ページiにPATTERN_2を書き込み
-                    // ========================================
+                    // テスト2
                     *ptr_i = PATTERN_2;
                     __builtin___clear_cache((char*)addr_i, (char*)addr_i + sizeof(uint64_t));
                     asm volatile("mfence" ::: "memory");
                     
-                    // ページjを再度確認
                     __builtin___clear_cache((char*)addr_j, (char*)addr_j + sizeof(uint64_t));
                     asm volatile("mfence" ::: "memory");
                     uint64_t value_j_2 = *ptr_j;
@@ -573,14 +600,11 @@ void *alias_worker_v2(void *arg) {
                         continue;
                     }
                     
-                    // ========================================
-                    // テスト3: ページiにPATTERN_3を書き込み
-                    // ========================================
+                    // テスト3
                     *ptr_i = PATTERN_3;
                     __builtin___clear_cache((char*)addr_i, (char*)addr_i + sizeof(uint64_t));
                     asm volatile("mfence" ::: "memory");
                     
-                    // ページjを再度確認
                     __builtin___clear_cache((char*)addr_j, (char*)addr_j + sizeof(uint64_t));
                     asm volatile("mfence" ::: "memory");
                     uint64_t value_j_3 = *ptr_j;
@@ -589,28 +613,23 @@ void *alias_worker_v2(void *arg) {
                         continue;
                     }
                     
-                    // ========================================
-                    // テスト4: 逆方向確認（jからi）
-                    // ========================================
+                    // テスト4: 逆方向
                     uint64_t original_value_j = *ptr_j;
-                    
                     const uint64_t PATTERN_REVERSE = 0xAAAAAAAABBBBBBBB;
                     *ptr_j = PATTERN_REVERSE;
                     __builtin___clear_cache((char*)addr_j, (char*)addr_j + sizeof(uint64_t));
                     asm volatile("mfence" ::: "memory");
                     
-                    // ページiを確認
                     __builtin___clear_cache((char*)addr_i, (char*)addr_i + sizeof(uint64_t));
                     asm volatile("mfence" ::: "memory");
                     uint64_t value_i_reverse = *ptr_i;
                     
                     if (value_i_reverse != PATTERN_REVERSE) {
+                        *ptr_j = original_value_j; // 復元してからcontinue
                         continue;
                     }
                     
-                    // ========================================
-                    // 全テスト合格！確実なエイリアス
-                    // ========================================
+                    // エイリアス検出成功
                     pthread_mutex_lock(&g_alias_mutex);
                     g_pairs_found++;
                     printf("\n=== CONFIRMED ALIAS DETECTED ===\n");
@@ -618,35 +637,34 @@ void *alias_worker_v2(void *arg) {
                            i, addr_i, get_physical_address(addr_i));
                     printf("  Page %zu: Virtual=%p, Physical=0x%lx\n",
                            j, addr_j, get_physical_address(addr_j));
-                    printf("  Tests passed:\n");
-                    printf("    Forward 1: i=%016lx -> j=%016lx ✓\n", PATTERN_1, value_j_1);
-                    printf("    Forward 2: i=%016lx -> j=%016lx ✓\n", PATTERN_2, value_j_2);
-                    printf("    Forward 3: i=%016lx -> j=%016lx ✓\n", PATTERN_3, value_j_3);
-                    printf("    Reverse:   j=%016lx -> i=%016lx ✓\n", 
-                           PATTERN_REVERSE, value_i_reverse);
+                    printf("  All 4 tests passed ✓\n");
                     printf("================================\n\n");
                     pthread_mutex_unlock(&g_alias_mutex);
                     
-                    // 元の値を復元
                     *ptr_j = original_value_j;
                     
-                } else {
-                    // 読み取り時にSegFault（スキップ）
-                }
-            }
+                } // inner sigsetjmp
+            } // inner loop
             
-            // ページiの元の値を復元
+restore_i:
             *ptr_i = original_value_i;
             
-        } else {
-            // 外側のループでSegFault（スキップ）
-        }
+        } // outer sigsetjmp
         
-        sigaction(SIGSEGV, &old_sa, NULL);
-        
-        // 進捗を更新
         __sync_fetch_and_add(&g_alias_processed, 1);
     }
+    
+    // シグナルハンドラを復元
+    sigaction(SIGSEGV, &old_sa, NULL);
+    
+    // 最終カナリアチェック
+    volatile uint64_t canary_end = STACK_CANARY;
+    if (canary_start != STACK_CANARY || canary_end != STACK_CANARY) {
+        pthread_mutex_lock(&g_print_mutex);
+        printf("\n!!! Final stack corruption detected !!!\n");
+        pthread_mutex_unlock(&g_print_mutex);
+    }
+    
     return NULL;
 }
 
