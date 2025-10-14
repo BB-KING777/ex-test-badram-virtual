@@ -11,46 +11,6 @@
 #include <signal.h>
 #include <setjmp.h>
 
-// キャッシュライン強制フラッシュ関数群
-static inline void clflush(volatile void *p) {
-    asm volatile("clflush (%0)" : : "r"(p) : "memory");
-}
-
-static inline void clflushopt(volatile void *p) {
-    asm volatile("clflushopt (%0)" : : "r"(p) : "memory");
-}
-
-static inline void mfence(void) {
-    asm volatile("mfence" ::: "memory");
-}
-
-static inline void sfence(void) {
-    asm volatile("sfence" ::: "memory");
-}
-
-// キャッシュライン全体をフラッシュ (64バイト)
-void flush_cache_line(void *addr) {
-    uintptr_t aligned_addr = ((uintptr_t)addr) & ~(64UL - 1);
-    clflush((void*)aligned_addr);
-    mfence();
-}
-
-// 指定範囲のキャッシュをフラッシュ
-void flush_range(void *addr, size_t size) {
-    uintptr_t start = ((uintptr_t)addr) & ~(64UL - 1);
-    uintptr_t end = ((uintptr_t)addr + size + 63) & ~(64UL - 1);
-    
-    for (uintptr_t p = start; p < end; p += 64) {
-        clflush((void*)p);
-    }
-    mfence();
-}
-
-// すべてのキャッシュを強制的にメモリに書き戻す
-void flush_all_caches(void) {
-    asm volatile("wbinvd" ::: "memory"); // 特権命令なので使えない場合あり
-}
-
 // Constant definitions
 #define PAGE_SIZE 0x1000
 #define MB (1024UL * 1024)
@@ -106,10 +66,10 @@ typedef struct {
 } AliasThreadData;
 
 typedef struct {
-    size_t *valid_indices;  // 有効なインデックスの配列
-    size_t start_index;     // valid_indices内の開始位置
-    size_t end_index;       // valid_indices内の終了位置
-    size_t valid_count;     // 有効なインデックスの総数
+    size_t *valid_indices;
+    size_t start_index;
+    size_t end_index;
+    size_t valid_count;
 } AliasThreadDataV2;
 
 // Global variables
@@ -134,11 +94,73 @@ void segv_handler(int sig) {
     siglongjmp(segv_jmp_buf, 1);
 }
 
+// ========================================
+// 安全なキャッシュフラッシュ関数
+// ========================================
+
+// シンプル版: セグフォルト保護なし（高速）
+static inline void simple_clflush(volatile void *p) {
+    if (p == NULL) return;
+    
+    uintptr_t addr = (uintptr_t)p;
+    if (addr < 0x1000 || addr >= 0x800000000000ULL) {
+        return;
+    }
+    
+    // キャッシュラインにアライン
+    uintptr_t aligned = addr & ~(64UL - 1);
+    
+    asm volatile("clflush (%0)" : : "r"(aligned) : "memory");
+}
+
+// 安全版: セグフォルト保護あり（低速だが安全）
+static inline int safe_clflush(volatile void *p) {
+    if (p == NULL) return 0;
+    
+    uintptr_t addr = (uintptr_t)p;
+    
+    if (addr < 0x1000 || addr >= 0x800000000000ULL) {
+        return 0;
+    }
+    
+    // キャッシュラインにアライン
+    uintptr_t aligned = addr & ~(64UL - 1);
+    
+    // セグフォルト保護
+    struct sigaction sa, old_sa;
+    sa.sa_handler = segv_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_NODEFER;
+    
+    if (sigaction(SIGSEGV, &sa, &old_sa) == -1) {
+        return 0;
+    }
+    
+    volatile sig_atomic_t old_segv = segv_occurred;
+    segv_occurred = 0;
+    
+    sigjmp_buf local_jmp_buf;
+    memcpy(&local_jmp_buf, &segv_jmp_buf, sizeof(sigjmp_buf));
+    
+    if (sigsetjmp(segv_jmp_buf, 1) == 0) {
+        asm volatile("clflush (%0)" : : "r"(aligned) : "memory");
+        asm volatile("mfence" ::: "memory");
+        sigaction(SIGSEGV, &old_sa, NULL);
+        memcpy(&segv_jmp_buf, &local_jmp_buf, sizeof(sigjmp_buf));
+        segv_occurred = old_segv;
+        return 1;
+    } else {
+        sigaction(SIGSEGV, &old_sa, NULL);
+        memcpy(&segv_jmp_buf, &local_jmp_buf, sizeof(sigjmp_buf));
+        segv_occurred = old_segv;
+        return 0;
+    }
+}
+
 // =============================================================================
 // Address validation functions
 // =============================================================================
 
-// Check if address is in valid user space range
 int is_valid_user_address(void *addr) {
     uintptr_t addr_val = (uintptr_t)addr;
     
@@ -146,7 +168,6 @@ int is_valid_user_address(void *addr) {
         return 0;
     }
     
-    // Linux x86_64 user space: 0x1000 ~ 0x7fffffffffff
     if (addr_val < 0x1000 || addr_val >= 0x800000000000ULL) {
         return 0;
     }
@@ -154,12 +175,10 @@ int is_valid_user_address(void *addr) {
     return 1;
 }
 
-// Check if address is accessible (can read/write without segfault)
 int is_address_accessible(void *addr, size_t size) {
     struct sigaction sa, old_sa;
     int result = 1;
     
-    // Setup signal handler
     sa.sa_handler = segv_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
@@ -170,19 +189,15 @@ int is_address_accessible(void *addr, size_t size) {
     
     segv_occurred = 0;
     
-    // Try to read and write
     if (sigsetjmp(segv_jmp_buf, 1) == 0) {
         volatile uint8_t *ptr = (volatile uint8_t *)addr;
         
-        // Test read at start
         volatile uint8_t dummy = ptr[0];
         
-        // Test write at start
         uint8_t original = ptr[0];
         ptr[0] = 0xAA;
         ptr[0] = original;
         
-        // Test at end of range
         dummy = ptr[size - 1];
         
         (void)dummy;
@@ -190,13 +205,11 @@ int is_address_accessible(void *addr, size_t size) {
         result = 0;
     }
     
-    // Restore original handler
     sigaction(SIGSEGV, &old_sa, NULL);
     
     return result && !segv_occurred;
 }
 
-// Comprehensive address validation
 typedef enum {
     ADDR_VALID = 0,
     ADDR_NULL,
@@ -215,17 +228,14 @@ const char* addr_validation_string(AddressValidation result) {
 }
 
 AddressValidation validate_address(void *addr, size_t size) {
-    // 1. NULL check
     if (addr == NULL) {
         return ADDR_NULL;
     }
     
-    // 2. Range check
     if (!is_valid_user_address(addr)) {
         return ADDR_OUT_OF_RANGE;
     }
     
-    // 3. Accessibility check (most important)
     if (!is_address_accessible(addr, size)) {
         return ADDR_NOT_ACCESSIBLE;
     }
@@ -522,7 +532,6 @@ void *alias_worker_v2(void *arg) {
     const uint64_t PATTERN_1 = 0xDEADBEEFCAFEBABE;
     const uint64_t PATTERN_2 = 0x0123456789ABCDEF;
     const uint64_t PATTERN_3 = 0xFEDCBA9876543210;
-    const uint64_t PATTERN_REVERSE = 0xAAAAAAAABBBBBBBB;
 
     struct sigaction sa, old_sa;
     sa.sa_handler = segv_handler;
@@ -536,14 +545,17 @@ void *alias_worker_v2(void *arg) {
     for (size_t idx_i = data->start_index; idx_i < data->end_index; idx_i++) {
         if (canary_start != STACK_CANARY) {
             pthread_mutex_lock(&g_print_mutex);
-            printf("\n!!! Stack corruption detected !!!\n");
+            printf("\n!!! Stack corruption detected in thread !!!\n");
             pthread_mutex_unlock(&g_print_mutex);
             break;
         }
         
-        if (idx_i >= data->valid_count) break;
+        if (idx_i >= data->valid_count) {
+            break;
+        }
         
         size_t i = data->valid_indices[idx_i];
+        
         if (i >= block_count) {
             __sync_fetch_and_add(&g_alias_processed, 1);
             continue;
@@ -567,40 +579,36 @@ void *alias_worker_v2(void *arg) {
         if (sigsetjmp(segv_jmp_buf, 1) == 0) {
             volatile uint64_t *ptr_i = (volatile uint64_t *)addr_i;
             
-            // ========================================
-            // 重要: 初期状態のキャッシュフラッシュ
-            // ========================================
-            flush_cache_line(addr_i);
-            mfence();
-            
-            // 読み取りテスト
             volatile uint64_t test_read = *ptr_i;
             (void)test_read;
             
             uint64_t original_value_i = *ptr_i;
             
             // ========================================
-            // フェーズ1: PATTERN_1書き込み
+            // パターン1書き込み + キャッシュフラッシュ
             // ========================================
             *ptr_i = PATTERN_1;
+            asm volatile("sfence" ::: "memory");
+            simple_clflush(addr_i);  // シンプル版を使用
+            asm volatile("mfence" ::: "memory");
             
-            // 重要: 書き込み後のフラッシュ
-            sfence();  // ストアバッファをフラッシュ
-            flush_cache_line(addr_i);
-            mfence();  // メモリバリア
-            
-            // 内側ループ
             for (size_t idx_j = idx_i + 1; idx_j < data->valid_count; idx_j++) {
                 if (canary_start != STACK_CANARY) {
                     goto restore_i;
                 }
                 
-                if (idx_j >= data->valid_count) break;
+                if (idx_j >= data->valid_count) {
+                    break;
+                }
                 
                 size_t j = data->valid_indices[idx_j];
-                if (j >= block_count) continue;
+                
+                if (j >= block_count) {
+                    continue;
+                }
                 
                 void *addr_j = mem_blocks[j].addr;
+                
                 if (addr_j == NULL) continue;
                 
                 uintptr_t addr_val_j = (uintptr_t)addr_j;
@@ -614,29 +622,26 @@ void *alias_worker_v2(void *arg) {
                 if (sigsetjmp(segv_jmp_buf, 1) == 0) {
                     
                     // ========================================
-                    // テスト1: jからPATTERN_1が見えるか？
+                    // テスト1: jから読み取り
                     // ========================================
-                    // 重要: 読み取り前にキャッシュをフラッシュ
-                    flush_cache_line(addr_j);
-                    mfence();
-                    
+                    simple_clflush(addr_j);
+                    asm volatile("mfence" ::: "memory");
                     uint64_t value_j_1 = *ptr_j;
                     
                     if (value_j_1 != PATTERN_1) {
-                        continue; // エイリアスではない
+                        continue;
                     }
                     
                     // ========================================
-                    // テスト2: PATTERN_2で再確認
+                    // テスト2: PATTERN_2
                     // ========================================
                     *ptr_i = PATTERN_2;
-                    sfence();
-                    flush_cache_line(addr_i);
-                    mfence();
+                    asm volatile("sfence" ::: "memory");
+                    simple_clflush(addr_i);
+                    asm volatile("mfence" ::: "memory");
                     
-                    // jから読み取り
-                    flush_cache_line(addr_j);
-                    mfence();
+                    simple_clflush(addr_j);
+                    asm volatile("mfence" ::: "memory");
                     uint64_t value_j_2 = *ptr_j;
                     
                     if (value_j_2 != PATTERN_2) {
@@ -644,15 +649,15 @@ void *alias_worker_v2(void *arg) {
                     }
                     
                     // ========================================
-                    // テスト3: PATTERN_3で三度確認
+                    // テスト3: PATTERN_3
                     // ========================================
                     *ptr_i = PATTERN_3;
-                    sfence();
-                    flush_cache_line(addr_i);
-                    mfence();
+                    asm volatile("sfence" ::: "memory");
+                    simple_clflush(addr_i);
+                    asm volatile("mfence" ::: "memory");
                     
-                    flush_cache_line(addr_j);
-                    mfence();
+                    simple_clflush(addr_j);
+                    asm volatile("mfence" ::: "memory");
                     uint64_t value_j_3 = *ptr_j;
                     
                     if (value_j_3 != PATTERN_3) {
@@ -660,66 +665,64 @@ void *alias_worker_v2(void *arg) {
                     }
                     
                     // ========================================
-                    // テスト4: 逆方向確認（jからi）
+                    // テスト4: 逆方向
                     // ========================================
                     uint64_t original_value_j = *ptr_j;
+                    const uint64_t PATTERN_REVERSE = 0xAAAAAAAABBBBBBBB;
                     
                     *ptr_j = PATTERN_REVERSE;
-                    sfence();
-                    flush_cache_line(addr_j);
-                    mfence();
+                    asm volatile("sfence" ::: "memory");
+                    simple_clflush(addr_j);
+                    asm volatile("mfence" ::: "memory");
                     
-                    // iから読み取り
-                    flush_cache_line(addr_i);
-                    mfence();
+                    simple_clflush(addr_i);
+                    asm volatile("mfence" ::: "memory");
                     uint64_t value_i_reverse = *ptr_i;
                     
                     if (value_i_reverse != PATTERN_REVERSE) {
                         *ptr_j = original_value_j;
-                        sfence();
-                        flush_cache_line(addr_j);
-                        mfence();
+                        asm volatile("sfence" ::: "memory");
+                        simple_clflush(addr_j);
+                        asm volatile("mfence" ::: "memory");
                         continue;
                     }
                     
                     // ========================================
-                    // ✓ 全テスト合格 = 確実なエイリアス
+                    // エイリアス検出成功
                     // ========================================
                     pthread_mutex_lock(&g_alias_mutex);
                     g_pairs_found++;
-                    printf("\n╔════════════════════════════════════╗\n");
-                    printf("║  CONFIRMED ALIAS DETECTED          ║\n");
-                    printf("╚════════════════════════════════════╝\n");
+                    printf("\n╔═══════════════════════════════════╗\n");
+                    printf("║  CONFIRMED ALIAS DETECTED         ║\n");
+                    printf("╚═══════════════════════════════════╝\n");
                     printf("  Page %zu: Virtual=%p, Physical=0x%lx\n",
                            i, addr_i, get_physical_address(addr_i));
                     printf("  Page %zu: Virtual=%p, Physical=0x%lx\n",
                            j, addr_j, get_physical_address(addr_j));
-                    printf("  ✓ Forward Test 1:  i[0x%016lx] → j[0x%016lx]\n", 
+                    printf("  ✓ Forward 1:  0x%016lx → 0x%016lx\n", 
                            PATTERN_1, value_j_1);
-                    printf("  ✓ Forward Test 2:  i[0x%016lx] → j[0x%016lx]\n", 
+                    printf("  ✓ Forward 2:  0x%016lx → 0x%016lx\n", 
                            PATTERN_2, value_j_2);
-                    printf("  ✓ Forward Test 3:  i[0x%016lx] → j[0x%016lx]\n", 
+                    printf("  ✓ Forward 3:  0x%016lx → 0x%016lx\n", 
                            PATTERN_3, value_j_3);
-                    printf("  ✓ Reverse Test:    j[0x%016lx] → i[0x%016lx]\n", 
+                    printf("  ✓ Reverse:    0x%016lx → 0x%016lx\n", 
                            PATTERN_REVERSE, value_i_reverse);
-                    printf("════════════════════════════════════════\n\n");
+                    printf("═══════════════════════════════════════\n\n");
                     pthread_mutex_unlock(&g_alias_mutex);
                     
-                    // 元の値を復元
                     *ptr_j = original_value_j;
-                    sfence();
-                    flush_cache_line(addr_j);
-                    mfence();
+                    asm volatile("sfence" ::: "memory");
+                    simple_clflush(addr_j);
+                    asm volatile("mfence" ::: "memory");
                     
                 } // inner sigsetjmp
             } // inner loop
             
 restore_i:
-            // ページiの元の値を復元
             *ptr_i = original_value_i;
-            sfence();
-            flush_cache_line(addr_i);
-            mfence();
+            asm volatile("sfence" ::: "memory");
+            simple_clflush(addr_i);
+            asm volatile("mfence" ::: "memory");
             
         } // outer sigsetjmp
         
@@ -731,12 +734,17 @@ restore_i:
     volatile uint64_t canary_end = STACK_CANARY;
     if (canary_start != STACK_CANARY || canary_end != STACK_CANARY) {
         pthread_mutex_lock(&g_print_mutex);
-        printf("\n!!! Stack corruption detected at thread exit !!!\n");
+        printf("\n!!! Final stack corruption detected !!!\n");
         pthread_mutex_unlock(&g_print_mutex);
     }
     
     return NULL;
 }
+
+
+
+
+
 /*
 void *alias_worker(void *arg) {
     AliasThreadData *data = (AliasThreadData *)arg;
