@@ -91,6 +91,20 @@ void segv_handler(int sig) {
 }
 
 // =============================================================================
+// Cache flush functions
+// =============================================================================
+
+// clflush命令: キャッシュラインをフラッシュ
+static inline void clflush(volatile void *p) {
+    asm volatile("clflush (%0)" :: "r"(p) : "memory");
+}
+
+// メモリバリア
+static inline void mfence(void) {
+    asm volatile("mfence" ::: "memory");
+}
+
+// =============================================================================
 // Address validation functions
 // =============================================================================
 
@@ -471,11 +485,6 @@ void scan_all_processes_parallel(MappingTable *table) {
 void *alias_worker_v2_xor(void *arg) {
     AliasThreadDataV2 *data = (AliasThreadDataV2 *)arg;
     
-    // clflush命令のインライン関数
-    static inline void clflush(volatile void *p) {
-        asm volatile("clflush (%0)" :: "r"(p) : "memory");
-    }
-    
     // valid_indicesを使って有効なページのみスキャン
     for (size_t idx_i = data->start_index; idx_i < data->end_index; idx_i++) {
         size_t i = data->valid_indices[idx_i];
@@ -540,38 +549,38 @@ void *alias_worker_v2_xor(void *arg) {
                     
                     // flush(B)
                     clflush(ptr_j);
-                    asm volatile("mfence" ::: "memory");
+                    mfence();
                     
                     // write_mem(A, m1)
                     *ptr_i = m1;
                     clflush(ptr_i);
-                    asm volatile("mfence" ::: "memory");
+                    mfence();
                     
                     // flush(A)
                     clflush(ptr_i);
-                    asm volatile("mfence" ::: "memory");
+                    mfence();
                     
                     // g1 = read_mem(B)
                     clflush(ptr_j);
-                    asm volatile("mfence" ::: "memory");
+                    mfence();
                     uint64_t g1 = *ptr_j;
                     
                     // flush(B)
                     clflush(ptr_j);
-                    asm volatile("mfence" ::: "memory");
+                    mfence();
                     
                     // write_mem(A, m2)
                     *ptr_i = m2;
                     clflush(ptr_i);
-                    asm volatile("mfence" ::: "memory");
+                    mfence();
                     
                     // flush(A)
                     clflush(ptr_i);
-                    asm volatile("mfence" ::: "memory");
+                    mfence();
                     
                     // g2 = read_mem(B)
                     clflush(ptr_j);
-                    asm volatile("mfence" ::: "memory");
+                    mfence();
                     uint64_t g2 = *ptr_j;
                     
                     // ========================================
@@ -580,7 +589,7 @@ void *alias_worker_v2_xor(void *arg) {
                     uint64_t xor_written = m1 ^ m2;
                     uint64_t xor_read = g1 ^ g2;
                     
-                    if (xor_written == xor_read) {
+                    if (xor_written == xor_read && xor_written != 0) {
                         // エイリアス検出！
                         
                         pthread_mutex_lock(&g_alias_mutex);
@@ -594,8 +603,7 @@ void *alias_worker_v2_xor(void *arg) {
                         printf("    Read from B:  g1=%016lx, g2=%016lx\n", g1, g2);
                         printf("    m1 ⊕ m2 = %016lx\n", xor_written);
                         printf("    g1 ⊕ g2 = %016lx\n", xor_read);
-                        printf("    Match: %s ✓\n", 
-                               (xor_written == xor_read) ? "YES" : "NO");
+                        printf("    Match: YES ✓\n");
                         printf("===================================\n\n");
                         
                         pthread_mutex_unlock(&g_alias_mutex);
@@ -609,7 +617,7 @@ void *alias_worker_v2_xor(void *arg) {
             // ページiの元の値を復元
             *ptr_i = original_value_i;
             clflush(ptr_i);
-            asm volatile("mfence" ::: "memory");
+            mfence();
             
         } else {
             // 外側のループでSegFault（スキップ）
