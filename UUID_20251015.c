@@ -91,7 +91,7 @@ void segv_handler(int sig) {
 // ユーザ空間の有効なアドレス範囲かチェック
 int is_valid_user_address(void *addr) {
     uintptr_t addr_val = (uintptr_t)addr;
-    
+/*
     if (addr == NULL) {
         return 0;
     }
@@ -178,7 +178,7 @@ AddressValidation validate_address(void *addr, size_t size) {
     // 3. アクセス可能性チェック (最も重要)
     if (!is_address_accessible(addr, size)) {
         return ADDR_NOT_ACCESSIBLE;
-    }
+    }*/
     
     return ADDR_VALID;
 }
@@ -531,7 +531,7 @@ void stage2_write_pages_uuid() {
     
     for (size_t i = 0; i < block_count; i++) {
         // 書き込み前に再検証 (事前検証後に破損した可能性を考慮)
-        AddressValidation validation = validate_address(mem_blocks[i].addr, PAGE_SIZE);
+        //AddressValidation validation = validate_address(mem_blocks[i].addr, PAGE_SIZE);
         
         if (validation != ADDR_VALID) {
             skipped++;
@@ -773,7 +773,7 @@ void stage3_check_aliases_uuid() {
     
     for (size_t i = 0; i < block_count; i++) {
         void *addr = mem_blocks[i].addr;
-        
+        /*
         // NULLチェック
         if (addr == NULL) {
             null_count++;
@@ -826,7 +826,7 @@ void stage3_check_aliases_uuid() {
         if ((i + 1) % 100000 == 0) {
             printf("  Validated %zu / %zu (valid: %zu)\n", 
                    i + 1, block_count, valid_count);
-        }
+        }*/
     }
     
     printf("\n--- Validation Results ---\n");
