@@ -274,8 +274,6 @@ void stage2_write_pages_uuid() {
         return;
     }
     
-    // 検証ロジックはスキップ (Validation logic is skipped)
-
     printf("\nWriting UUID to each page...\n");
 
     size_t written = 0;
@@ -283,10 +281,11 @@ void stage2_write_pages_uuid() {
     size_t uuid_verify_errors = 0;
 
     for (size_t i = 0; i < block_count; i++) {
-        // UUID生成 (Generate UUID)
+        // UUID生成 
         PageUUID uuid = generate_page_uuid(mem_blocks[i].addr);
 
-        // シグナルハンドラ保護 (Signal handler protection)
+        // シグナルハンドラ保護 
+        /*
         struct sigaction sa, old_sa;
         sa.sa_handler = segv_handler;
         sigemptyset(&sa.sa_mask);
@@ -296,23 +295,26 @@ void stage2_write_pages_uuid() {
         segv_occurred = 0;
 
         if (sigsetjmp(segv_jmp_buf, 1) == 0) {
-            // UUID書き込み (Write UUID)
+        */
+            // UUID書き込み
             PageUUID *page_uuid = (PageUUID *)(mem_blocks[i].addr);
             *page_uuid = uuid;
 
-            // 検証: 読み戻して確認 (Verification: read back to confirm)
+            // 検証: 読み戻して確認 
             PageUUID read_back = *page_uuid;
 
             if (!verify_page_uuid(&read_back, mem_blocks[i].addr)) {
                 uuid_verify_errors++;
             }
             written++;
+        /*
         } else {
             // 書き込み中に予期しないSegFault (Unexpected SegFault during write)
             write_errors++;
         }
 
         sigaction(SIGSEGV, &old_sa, NULL);
+        */
 
         if (written % 100000 == 0 && written > 0) {
             printf("  %zu / %zu pages written (write_errors %zu)\n",
