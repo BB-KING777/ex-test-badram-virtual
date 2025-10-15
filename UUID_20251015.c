@@ -337,7 +337,7 @@ void stage1_allocate_memory() {
     printf("Available memory: %zu MB (%.2f GB)\n",
            available_mb, (double)available_mb / 1024);
     
-    size_t max_safe_mb = available_mb * 70 / 100;
+    size_t max_safe_mb = available_mb * 95 / 100;
     if (max_safe_mb > 10 * 1024) {
         max_safe_mb = 10 * 1024;
     }
