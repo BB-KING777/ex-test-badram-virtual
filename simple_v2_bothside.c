@@ -12,6 +12,17 @@ typedef struct {
     void *read_addr;
 } ErrorRecord;
 
+// キャッシュをフラッシュする関数
+static inline void flush_cache_line(void *addr) {
+    // x86/x64の場合: clflush命令でキャッシュラインをフラッシュ
+    asm volatile("clflush (%0)" : : "r"(addr) : "memory");
+}
+
+// メモリバリアを挿入する関数
+static inline void memory_barrier(void) {
+    asm volatile("mfence" ::: "memory");
+}
+
 int main() {
     printf("========================================\n");
     printf("  Simple BadRAM Detection Tool\n");
@@ -55,11 +66,17 @@ int main() {
         void **page = (void **)((char *)memory + i * PAGE_SIZE);
         *page = page;  // 自分自身のアドレスを書き込む
         
+        // 書き込み後にキャッシュをフラッシュ
+        flush_cache_line(page);
+        
         if ((i + 1) % 100000 == 0) {
             printf("  %zu / %zu pages done\n", i + 1, num_pages);
         }
     }
-    printf("Write complete\n");
+    
+    // 全ての書き込みがメモリに反映されるまで待機
+    memory_barrier();
+    printf("Write complete (cache flushed)\n");
     
     // ステップ4: 各ページをスキャンしてエラーを検出（エイリアス→オリジナル）
     printf("\nScanning (Alias -> Original)...\n");
@@ -67,6 +84,11 @@ int main() {
     
     for (size_t i = 0; i < num_pages; i++) {
         void **page = (void **)((char *)memory + i * PAGE_SIZE);
+        
+        // 読み出し前にキャッシュをフラッシュして、メモリから直接読む
+        flush_cache_line(page);
+        memory_barrier();
+        
         void *stored_addr = *page;  // 書き込んだアドレスを読み出す
         
         // 書き込んだアドレスと実際のアドレスが異なる場合
@@ -99,6 +121,14 @@ int main() {
             // actual addressに文字列を書き込む
             memcpy(actual, test_pattern, pattern_len);
             
+            // 書き込み後にキャッシュをフラッシュ
+            flush_cache_line(actual);
+            memory_barrier();
+            
+            // read addressのキャッシュもフラッシュ
+            flush_cache_line(read);
+            memory_barrier();
+            
             // read addressから読み出す
             if (memcmp(read, test_pattern, pattern_len) == 0) {
                 reverse_errors++;
@@ -115,11 +145,11 @@ int main() {
     printf("  Results\n");
     printf("========================================\n");
     printf("Pages scanned: %zu\n", num_pages);
-    printf("Aliasing errors (Alias -> Original): %d\n", error_count);
+    printf("Memory errors (Alias -> Original): %d\n", error_count);
     
     if (error_count > 0) {
-        printf("Bidirectional aliasing: %d\n", reverse_errors);
-        printf("One-way aliasing only: %d\n", error_count - reverse_errors);
+        printf("True aliasing (bidirectional): %d\n", reverse_errors);
+        printf("Read errors (not aliasing): %d\n", error_count - reverse_errors);
         printf("\n*** Possible BadRAM detected! ***\n");
     } else {
         printf("\nNo errors detected.\n");
