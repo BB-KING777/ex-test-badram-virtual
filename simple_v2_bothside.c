@@ -2,15 +2,22 @@
 #include <stdlib.h>
 #include <sys/sysinfo.h>
 #include <stdint.h>
+#include <string.h>
 
 #define PAGE_SIZE 4096
+#define MAX_ERRORS 10000  // 記録する最大エラー数
+
+typedef struct {
+    void *actual_addr;
+    void *read_addr;
+} ErrorRecord;
 
 int main() {
     printf("========================================\n");
     printf("  Simple BadRAM Detection Tool\n");
     printf("========================================\n\n");
     
-    // ステップ1: 空きメモリを確認
+    // ステップ1: 空きメモリの確認
     struct sysinfo info;
     if (sysinfo(&info) != 0) {
         perror("sysinfo failed");
@@ -18,14 +25,14 @@ int main() {
     }
     
     size_t free_memory = info.freeram * info.mem_unit;
-    size_t alloc_size = (free_memory * 95) / 100;  // 95%を使用
+    size_t alloc_size = (free_memory * 95) / 100;  // 空きメモリの95%を使用
     size_t num_pages = alloc_size / PAGE_SIZE;
     
     printf("Free memory: %zu MB\n", free_memory / (1024 * 1024));
     printf("Memory to allocate: %zu MB (%zu pages)\n", 
            alloc_size / (1024 * 1024), num_pages);
     
-    // ステップ2: メモリを確保
+    // ステップ2: メモリの確保
     printf("\nAllocating memory...\n");
     void *memory = malloc(alloc_size);
     if (memory == NULL) {
@@ -33,6 +40,14 @@ int main() {
         return 1;
     }
     printf("Allocation complete\n");
+    
+    // エラー記録用の配列を確保
+    ErrorRecord *errors = malloc(MAX_ERRORS * sizeof(ErrorRecord));
+    if (errors == NULL) {
+        printf("Error array allocation failed\n");
+        free(memory);
+        return 1;
+    }
     
     // ステップ3: 各ページに仮想アドレスを書き込む
     printf("\nWriting virtual address to each page...\n");
@@ -46,65 +61,21 @@ int main() {
     }
     printf("Write complete\n");
     
-    // ステップ4: 各ページをスキャンしてエラーやエイリアスをチェック
-    printf("\nScanning...\n");
-    int bad_count = 0;
+    // ステップ4: 各ページをスキャンしてエラーを検出（エイリアス→オリジナル）
+    printf("\nScanning (Alias -> Original)...\n");
+    int error_count = 0;
     
     for (size_t i = 0; i < num_pages; i++) {
         void **page = (void **)((char *)memory + i * PAGE_SIZE);
         void *stored_addr = *page;  // 書き込んだアドレスを読み出す
         
-        // 保存されたアドレスが実際のアドレスと異なる場合
+        // 書き込んだアドレスと実際のアドレスが異なる場合
         if (stored_addr != page) {
-            // ダブルチェック: 読み出したアドレスに書き込み、双方向エイリアスを検証
-            void **alias_page = (void **)stored_addr;
-            
-            // stored_addrが確保したメモリ範囲内か確認
-            if (stored_addr >= memory && 
-                stored_addr < (void *)((char *)memory + alloc_size)) {
-                
-                // エイリアス先の元の値を保存
-                void *original_value = *alias_page;
-                
-                // テストパターンを書き込む
-                void *test_pattern = (void *)0xDEADBEEF;
-                *alias_page = test_pattern;
-                
-                // 変更が実アドレスに反映されるか確認
-                if (*page == test_pattern) {
-                    printf("\n*** Bidirectional Alias detected! ***\n");
-                    printf("  Page %zu:\n", i);
-                    printf("  Address A (actual): %p\n", page);
-                    printf("  Address B (alias):  %p\n", stored_addr);
-                    printf("  -> Writing to B changes A: CONFIRMED\n");
-                    
-                    // 逆方向も検証
-                    *page = page;
-                    if (*alias_page == page) {
-                        printf("  -> Writing to A changes B: CONFIRMED\n");
-                        printf("  => TRUE BIDIRECTIONAL ALIAS\n");
-                    }
-                    
-                    bad_count++;
-                } else {
-                    // 双方向エイリアスではなく、単なる読み出しエラー
-                    printf("\n*** Read Error (not an alias) ***\n");
-                    printf("  Page %zu:\n", i);
-                    printf("  Actual address: %p\n", page);
-                    printf("  Read address: %p (unidirectional error)\n", stored_addr);
-                    bad_count++;
-                }
-                
-                // 元の値を復元
-                *alias_page = original_value;
-                
-            } else {
-                // アドレスが確保範囲外の場合はメモリ破損
-                printf("\n*** Memory Corruption detected! ***\n");
-                printf("  Page %zu:\n", i);
-                printf("  Actual address: %p\n", page);
-                printf("  Read address: %p (outside allocated range)\n", stored_addr);
-                bad_count++;
+            // エラーを記録
+            if (error_count < MAX_ERRORS) {
+                errors[error_count].actual_addr = page;
+                errors[error_count].read_addr = stored_addr;
+                error_count++;
             }
         }
         
@@ -113,20 +84,49 @@ int main() {
         }
     }
     
-    // ステップ5: 結果表示
+    // ステップ5: エラーが見つかった場合、逆方向のテストを実行
+    int reverse_errors = 0;
+    if (error_count > 0) {
+        printf("\nTesting reverse direction (Original -> Alias)...\n");
+        
+        const char *test_pattern = "Is This BadRAM?";
+        size_t pattern_len = strlen(test_pattern) + 1;
+        
+        for (int i = 0; i < error_count; i++) {
+            char *actual = (char *)errors[i].actual_addr;
+            char *read = (char *)errors[i].read_addr;
+            
+            // actual addressに文字列を書き込む
+            memcpy(actual, test_pattern, pattern_len);
+            
+            // read addressから読み出す
+            if (memcmp(read, test_pattern, pattern_len) == 0) {
+                reverse_errors++;
+            }
+            
+            if ((i + 1) % 10000 == 0) {
+                printf("  %d / %d pairs tested\n", i + 1, error_count);
+            }
+        }
+    }
+    
+    // ステップ6: 結果を表示
     printf("\n========================================\n");
     printf("  Results\n");
     printf("========================================\n");
     printf("Pages scanned: %zu\n", num_pages);
-    printf("Errors detected: %d\n", bad_count);
+    printf("Aliasing errors (Alias -> Original): %d\n", error_count);
     
-    if (bad_count > 0) {
+    if (error_count > 0) {
+        printf("Bidirectional aliasing: %d\n", reverse_errors);
+        printf("One-way aliasing only: %d\n", error_count - reverse_errors);
         printf("\n*** Possible BadRAM detected! ***\n");
     } else {
-        printf("No errors detected.\n");
+        printf("\nNo errors detected.\n");
     }
     
-    // Cleanup
+    // 後処理
+    free(errors);
     free(memory);
     
     return 0;
