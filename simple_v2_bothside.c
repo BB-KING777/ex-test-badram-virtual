@@ -18,15 +18,12 @@ static inline void flush_cache_line(void *addr) {
     asm volatile("clflush (%0)" : : "r"(addr) : "memory");
 }
 
-// メモリバリアを挿入する関数
+// メモリバリアを挿入する関数 = メモリの順序保障　Zenhammerで使っていた
 static inline void memory_barrier(void) {
     asm volatile("mfence" ::: "memory");
 }
 
 int main() {
-    printf("========================================\n");
-    printf("  Simple BadRAM Detection Tool\n");
-    printf("========================================\n\n");
     
     // ステップ1: 空きメモリの確認
     struct sysinfo info;
@@ -150,7 +147,7 @@ int main() {
     if (error_count > 0) {
         printf("True aliasing (bidirectional): %d\n", reverse_errors);
         printf("Read errors (not aliasing): %d\n", error_count - reverse_errors);
-        printf("\n*** Possible BadRAM detected! ***\n");
+        printf("\n*** Possible BadRAM detected! ***\n");// add
     } else {
         printf("\nNo errors detected.\n");
     }
