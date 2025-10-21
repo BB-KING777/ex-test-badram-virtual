@@ -48,6 +48,16 @@ int main() {
         return 1;
     }
     printf("Allocation complete\n");
+
+    // mlockを用いてページスワップが起こらないように固定する
+    printf("Locking memory (mlock) to prevent swap...\n");
+    if (mlock(memory, alloc_size) != 0) {
+        perror("mlock failed. (Try running as root or increase 'ulimit -l')");
+        // mlockが失敗した場合、終了
+        free(memory);
+        return 1;
+    }
+    printf("Memory locked successfully.\n");
     
     // エラー記録用の配列を確保
     ErrorRecord *errors = malloc(MAX_ERRORS * sizeof(ErrorRecord));
@@ -154,6 +164,13 @@ int main() {
     
     // 後処理
     free(errors);
+
+    //mlockをアンロックするmunlock
+    printf("\nUnlocking memory (munlock)...\n");
+    if (munlock(memory, alloc_size) != 0) {
+        perror("munlock failed");
+    }
+    
     free(memory);
     
     return 0;
