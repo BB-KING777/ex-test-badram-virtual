@@ -16,14 +16,11 @@ typedef struct {
 } ErrorRecord;
 
 // キャッシュラインサイズ（通常64バイト）
-// sysconf(_SC_LEVEL1_DCACHE_LINESIZE) で取得も可能ですが、
-// 多くのx86_64環境で64に固定されているため定数として扱います。
+// sysconf(_SC_LEVEL1_DCACHE_LINESIZE) で取得も可能らしい、
+// x86_64環境で64に固定されているため定数
 #define CACHE_LINE_SIZE 64
 
-/**
- * @brief ページ全体（PAGE_SIZE）をキャッシュからフラッシュする関数
- * @param addr フラッシュしたいページの先頭アドレス
- */
+
 static inline void flush_page(void *addr) {
     char *ptr = (char *)addr;
     
@@ -35,26 +32,19 @@ static inline void flush_page(void *addr) {
     }
 }
 
-/**
- * @brief メモリバリアを挿入する関数 (メモリ操作の順序保障)
- */
+// メモリバリアで入れ替える
 static inline void memory_barrier(void) {
     asm volatile("mfence" ::: "memory");
 }
 
-/**
- * @brief CSVファイルから最後に完了した(percentage, trial)を読み取る
- * @param start_pct 開始するパーセンテージ（出力）
- * @param start_trial 開始する試行番号（出力）
- * @return 0: 最初から開始, 1: 途中から再開
- */
+//進捗をCSVから読み取る関数
 int read_progress(int *start_pct, int *start_trial) {
     FILE *fp = fopen(CSV_FILENAME, "r");
     if (fp == NULL) {
         // ファイルが存在しない場合は最初から
         *start_pct = 95;
         *start_trial = 1;
-        return 0;
+        return 0;//最初から実行
     }
     
     char line[512];
@@ -65,25 +55,24 @@ int read_progress(int *start_pct, int *start_trial) {
     fgets(line, sizeof(line), fp);
     
     // 最後の行を読む
-    while (fgets(line, sizeof(line), fp) != NULL) {
+    while (fgets(line, sizeof(line), fp) != NULL) {//各行を解析して最後の試行を特定
         int pct, trial;
-        if (sscanf(line, "%d,%d", &pct, &trial) == 2) {
+        if (sscanf(line, "%d,%d", &pct, &trial) == 2) {//行の先頭からpercentageとtrialを読み取る
             last_pct = pct;
-            last_trial = trial;
+            last_trial = trial;//最後の試行を更新
         }
     }
     
-    fclose(fp);
+    fclose(fp);//クローズ!!!!!!!!!!!!
     
     // 次の試行を計算
-    if (last_trial < 50) {
+    if (last_trial < 50) {//50回未満なら同じパーセンテージで次の試行
         *start_pct = last_pct;
         *start_trial = last_trial + 1;
-    } else if (last_pct > 1) {
+    } else if (last_pct > 1) {//50回完了していて、まだ1%以上なら次のパーセンテージに移動
         *start_pct = last_pct - 1;
         *start_trial = 1;
-    } else {
-        // すべて完了済み
+    } else {//すべて完了済み
         printf("All experiments already completed!\n");
         exit(0);
     }
@@ -91,44 +80,40 @@ int read_progress(int *start_pct, int *start_trial) {
     return 1;
 }
 
-/**
- * @brief CSVファイルに結果を追記
- */
+//引数はCSVに保存する各種データの値
 void append_result(int percentage, int trial, const char *result, 
                    int error_count, int reverse_errors,
                    size_t allocated_mb, size_t allocated_pages,
                    size_t free_mb, double exec_time) {
-    FILE *fp = fopen(CSV_FILENAME, "a");
+    FILE *fp = fopen(CSV_FILENAME, "a");//追記モードで開く
     if (fp == NULL) {
         perror("Failed to open CSV file");
         return;
-    }
+    }//各データをCSV形式で書き込む
     
     fprintf(fp, "%d,%d,%s,%d,%d,%zu,%zu,%zu,%.2f\n",
             percentage, trial, result, error_count, reverse_errors,
-            allocated_mb, allocated_pages, free_mb, exec_time);
+            allocated_mb, allocated_pages, free_mb, exec_time);//各データをCSV形式で書き込む
     
-    fclose(fp);
+    fclose(fp);//ファイルを閉じる
 }
 
-/**
- * @brief CSVファイルのヘッダーを作成（ファイルが存在しない場合のみ）
- */
-void create_csv_header() {
+
+void create_csv_header() {//CSVファイルのヘッダーを作成
     FILE *fp = fopen(CSV_FILENAME, "r");
-    if (fp != NULL) {
+    if (fp != NULL) {//Not NULLなら既にファイルが存在する
         fclose(fp);
         return; // ファイルが既に存在する
     }
     
-    fp = fopen(CSV_FILENAME, "w");
-    if (fp == NULL) {
+    fp = fopen(CSV_FILENAME, "w");//新規作成モードで開く
+    if (fp == NULL) {//開けなかった場合
         perror("Failed to create CSV file");
         exit(1);
     }
     
-    fprintf(fp, "percentage,trial,result,error_count,reverse_errors,allocated_mb,allocated_pages,free_memory_mb,execution_time_sec\n");
-    fclose(fp);
+    fprintf(fp, "percentage,trial,result,error_count,reverse_errors,allocated_mb,allocated_pages,free_memory_mb,execution_time_sec\n");//ヘッダー行を書き込む
+    fclose(fp);//ファイルを閉じる
 }
 
 int main() {
@@ -156,88 +141,79 @@ int main() {
     for (int percentage = start_pct; percentage >= 1; percentage--) {
         int start = (percentage == start_pct) ? start_trial : 1;
         
-        for (int trial = start; trial <= 50; trial++) {
-            clock_t start_time = clock();
+        for (int trial = start; trial <= 50; trial++) {//各試行
+            clock_t start_time = clock();//時間計測開始!!!
             
             printf("\n----------------------------------------\n");
             printf("[%d%% - Trial %d/50]\n", percentage, trial);
             printf("----------------------------------------\n");
             
             // ステップ1: 空きメモリの確認
-            struct sysinfo info;
-            if (sysinfo(&info) != 0) {
+            struct sysinfo info;//これマジで便利
+            if (sysinfo(&info) != 0) {//失敗した場合
                 perror("sysinfo failed");
                 continue;
             }
             
             size_t free_memory = info.freeram * info.mem_unit;
-            size_t alloc_size = (free_memory * percentage) / 100; // 指定された%を使用
-            size_t num_pages = alloc_size / PAGE_SIZE;
+            size_t alloc_size = (free_memory * percentage) / 100; // 指定された%を使用,percentage%のメモリを確保
+            size_t num_pages = alloc_size / PAGE_SIZE;// ページ数計算
             
-            // alloc_sizeをPAGE_SIZEの倍数に丸めます
+            // alloc_sizeをPAGE_SIZEの倍数に丸めます,理由はページ単位で確保するためずれると困る
             alloc_size = num_pages * PAGE_SIZE;
 
-            printf("Free memory: %zu MB\n", free_memory / (1024 * 1024));
+            printf("Free memory: %zu MB\n", free_memory / (1024 * 1024));//MB単位で表示
             printf("Memory to allocate: %zu MB (%zu pages)\n", 
                    alloc_size / (1024 * 1024), num_pages);
             
-            // ステップ2: メモリの確保 (posix_memalignでページ境界に合わせる)
+            // ステップ2: メモリの確保 
             printf("\nAllocating memory (aligned to page size)...\n");
-            void *memory;
-            // メモリをPAGE_SIZE境界にアライメントして確保
-            if (posix_memalign(&memory, PAGE_SIZE, alloc_size) != 0) {
-                printf("Aligned memory allocation failed\n");
-                append_result(percentage, trial, "ALLOC_FAIL", 0, 0,
-                            alloc_size / (1024 * 1024), num_pages,
-                            free_memory / (1024 * 1024), 0.0);
-                continue;
-            }
-            
-            if (memory == NULL) {
+            void *memory = malloc(alloc_size);//メモリ確保
+            if (memory == NULL) {//失敗した場合
                 printf("Memory allocation failed\n");
                 append_result(percentage, trial, "ALLOC_FAIL", 0, 0,
                             alloc_size / (1024 * 1024), num_pages,
-                            free_memory / (1024 * 1024), 0.0);
+                            free_memory / (1024 * 1024), 0.0);//失敗結果をCSVに保存
                 continue;
             }
             printf("Allocation complete\n");
 
             // エラー記録用の配列を確保
-            ErrorRecord *errors = malloc(MAX_ERRORS * sizeof(ErrorRecord));
-            if (errors == NULL) {
+            ErrorRecord *errors = malloc(MAX_ERRORS * sizeof(ErrorRecord));//エラー記録用配列確保
+            if (errors == NULL) {//失敗した場合
                 printf("Error array allocation failed\n");
                 free(memory);
                 continue;
             }
             
             // ステップ3: 各ページに仮想アドレスを書き込む
-            printf("\nWriting virtual address to each page...\n");
-            for (size_t i = 0; i < num_pages; i++) {
-                void **page = (void **)((char *)memory + i * PAGE_SIZE);
+            printf("\nWriting virtual address to each page...\n");//各ページに自分自身のアドレスを書き込む
+            for (size_t i = 0; i < num_pages; i++) {//ループ開始
+                void **page = (void **)((char *)memory + i * PAGE_SIZE);//ページの先頭アドレスを取得
                 
                 // ページ先頭に自分自身のアドレスを書き込む
                 *page = page;
                 
-                // ★変更点: 書き込み後にページ全体をキャッシュからフラッシュ
+                // 書き込み後にページ全体をキャッシュからフラッシュ
                 flush_page(page);
                 
                 if ((i + 1) % 100000 == 0) {
-                    printf("  %zu / %zu pages done\n", i + 1, num_pages);
+                    printf("  %zu / %zu pages done\n", i + 1, num_pages);//進捗表示
                 }
             }
             
             // 全ての書き込みがメモリに反映されるまで待機
-            memory_barrier();
-            printf("Write complete (cache flushed)\n");
+            memory_barrier();//みんな大好きメモリバリア
+            printf("Write complete (cache flushed)\n");//書き込み完了表示
             
             // ステップ4: 各ページをスキャンしてエラーを検出（エイリアス→オリジナル）
             printf("\nScanning (Alias -> Original)...\n");
             int error_count = 0;
             
             for (size_t i = 0; i < num_pages; i++) {
-                void **page = (void **)((char *)memory + i * PAGE_SIZE);
-                
-                // ★変更点: 読み出し前にページ全体をキャッシュからフラッシュ
+                void **page = (void **)((char *)memory + i * PAGE_SIZE);//ページの先頭アドレスを取得
+
+                // 読み出し前にページ全体をキャッシュからフラッシュ
                 flush_page(page);
                 memory_barrier();
                 
@@ -279,12 +255,12 @@ int main() {
                     
                     // actual addressに文字列を書き込む
                     memcpy(actual, test_pattern, pattern_len);
-                    
-                    // ★変更点: 書き込み後にページ全体をキャッシュをフラッシュ
+
+                    // 書き込み後にページ全体をキャッシュをフラッシュ
                     flush_page(actual);
                     memory_barrier();
-                    
-                    // ★変更点: read addressのページ全体をキャッシュもフラッシュ
+
+                    // read addressのページ全体をキャッシュもフラッシュ
                     flush_page(read);
                     memory_barrier();
                     
