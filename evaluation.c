@@ -11,10 +11,10 @@
 #define CSV_FILENAME "evaluation.csv"
 
 // 追加: 試行回数とパーセンテージステップの設定
-#define NUM_TRIALS 10        // 各パーセンテージで実行する試行回数
-#define PERCENTAGE_STEP 1    // パーセンテージの減少ステップ（1なら95,94,93...、5なら95,90,85...）
-#define START_PERCENTAGE 95  // 開始パーセンテージ
-#define END_PERCENTAGE 1     // 終了パーセンテージ
+#define NUM_TRIALS 10        
+#define PERCENTAGE_STEP 1    
+#define START_PERCENTAGE 95  
+#define END_PERCENTAGE 1     
 
 typedef struct {
     void *actual_addr;
