@@ -10,6 +10,12 @@
 #define MAX_ERRORS 10000 // 記録する最大エラー数
 #define CSV_FILENAME "evaluation.csv"
 
+// 追加: 試行回数とパーセンテージステップの設定
+#define NUM_TRIALS 10        // 各パーセンテージで実行する試行回数
+#define PERCENTAGE_STEP 1    // パーセンテージの減少ステップ（1なら95,94,93...、5なら95,90,85...）
+#define START_PERCENTAGE 95  // 開始パーセンテージ
+#define END_PERCENTAGE 1     // 終了パーセンテージ
+
 typedef struct {
     void *actual_addr;
     void *read_addr;
@@ -42,13 +48,13 @@ int read_progress(int *start_pct, int *start_trial) {
     FILE *fp = fopen(CSV_FILENAME, "r");
     if (fp == NULL) {
         // ファイルが存在しない場合は最初から
-        *start_pct = 95;
+        *start_pct = START_PERCENTAGE;
         *start_trial = 1;
         return 0;//最初から実行
     }
     
     char line[512];
-    int last_pct = 95;
+    int last_pct = START_PERCENTAGE;
     int last_trial = 0;
     
     // ヘッダー行をスキップ
@@ -66,11 +72,11 @@ int read_progress(int *start_pct, int *start_trial) {
     fclose(fp);//クローズ!!!!!!!!!!!!
     
     // 次の試行を計算
-    if (last_trial < 50) {//50回未満なら同じパーセンテージで次の試行
+    if (last_trial < NUM_TRIALS) {//NUM_TRIALS回未満なら同じパーセンテージで次の試行
         *start_pct = last_pct;
         *start_trial = last_trial + 1;
-    } else if (last_pct > 1) {//50回完了していて、まだ1%以上なら次のパーセンテージに移動
-        *start_pct = last_pct - 1;
+    } else if (last_pct > END_PERCENTAGE) {//NUM_TRIALS回完了していて、まだEND_PERCENTAGE以上なら次のパーセンテージに移動
+        *start_pct = last_pct - PERCENTAGE_STEP;
         *start_trial = 1;
     } else {//すべて完了済み
         printf("All experiments already completed!\n");
@@ -121,6 +127,11 @@ int main() {
     printf("========================================\n");
     printf("  Memory Test Evaluation System\n");
     printf("========================================\n");
+    printf("Configuration:\n");
+    printf("  Trials per percentage: %d\n", NUM_TRIALS);
+    printf("  Percentage range: %d%% to %d%% (step: %d%%)\n", 
+           START_PERCENTAGE, END_PERCENTAGE, PERCENTAGE_STEP);
+    printf("========================================\n");
     
     // CSV初期化
     create_csv_header();
@@ -132,20 +143,20 @@ int main() {
     if (resumed) {
         printf("\nResuming from %d%% - Trial %d\n", start_pct, start_trial);
     } else {
-        printf("\nStarting from the beginning (95%% - Trial 1)\n");
+        printf("\nStarting from the beginning (%d%% - Trial 1)\n", START_PERCENTAGE);
     }
     
     printf("========================================\n\n");
     
-    // メインループ: 95%から1%まで、各50回ずつ
-    for (int percentage = start_pct; percentage >= 1; percentage--) {
+    // メインループ: START_PERCENTAGEからEND_PERCENTAGEまで、各NUM_TRIALS回ずつ
+    for (int percentage = start_pct; percentage >= END_PERCENTAGE; percentage -= PERCENTAGE_STEP) {
         int start = (percentage == start_pct) ? start_trial : 1;
         
-        for (int trial = start; trial <= 50; trial++) {//各試行
+        for (int trial = start; trial <= NUM_TRIALS; trial++) {//各試行
             clock_t start_time = clock();//時間計測開始!!!
             
             printf("\n----------------------------------------\n");
-            printf("[%d%% - Trial %d/50]\n", percentage, trial);
+            printf("[%d%% - Trial %d/%d]\n", percentage, trial, NUM_TRIALS);
             printf("----------------------------------------\n");
             
             // ステップ1: 空きメモリの確認
