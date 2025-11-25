@@ -21,262 +21,431 @@ typedef struct {
     void *read_addr;
 } ErrorRecord;
 
+// 試行結果を保存する構造体
+typedef struct {
+    const char *result;
+    int error_count;
+    int reverse_errors;
+    size_t allocated_mb;
+    size_t allocated_pages;
+    size_t free_mb;
+    double exec_time;
+} TrialResult;
+
 // キャッシュラインサイズ（通常64バイト）
-// sysconf(_SC_LEVEL1_DCACHE_LINESIZE) で取得も可能らしい、
-// x86_64環境で64に固定されているため定数
 #define CACHE_LINE_SIZE 64
 
 
 static inline void flush_page(void *addr) {
     char *ptr = (char *)addr;
     
-    // ページ内のすべてのキャッシュライン（4096 / 64 = 64回）に対して
-    // clflushを実行します。
     for (size_t i = 0; i < PAGE_SIZE; i += CACHE_LINE_SIZE) {
-        // x86/x64: clflush命令でキャッシュラインをフラッシュ
         asm volatile("clflush (%0)" : : "r"(ptr + i) : "memory");
     }
 }
 
-// メモリバリアで入れ替える
 static inline void memory_barrier(void) {
     asm volatile("mfence" ::: "memory");
 }
 
-//進捗をCSVから読み取る関数
-int read_progress(int *start_pct, int *start_trial) {
+//進捗をCSVから読み取る関数（パーセンテージ単位で管理）
+int read_progress(int *start_pct) {
     FILE *fp = fopen(CSV_FILENAME, "r");
     if (fp == NULL) {
-        // ファイルが存在しない場合は最初から
         *start_pct = START_PERCENTAGE;
-        *start_trial = 1;
-        return 0;//最初から実行
+        return 0;
     }
     
     char line[512];
     int last_pct = START_PERCENTAGE;
-    int last_trial = 0;
+    int trial_count = 0;
+    int current_pct = -1;
     
     // ヘッダー行をスキップ
     fgets(line, sizeof(line), fp);
     
-    // 最後の行を読む
-    while (fgets(line, sizeof(line), fp) != NULL) {//各行を解析して最後の試行を特定
+    // 最後のパーセンテージと試行数を数える
+    while (fgets(line, sizeof(line), fp) != NULL) {
         int pct, trial;
-        if (sscanf(line, "%d,%d", &pct, &trial) == 2) {//行の先頭からpercentageとtrialを読み取る
+        if (sscanf(line, "%d,%d", &pct, &trial) == 2) {
+            if (pct != current_pct) {
+                current_pct = pct;
+                trial_count = 1;
+            } else {
+                trial_count++;
+            }
             last_pct = pct;
-            last_trial = trial;//最後の試行を更新
         }
     }
     
-    fclose(fp);//クローズ!!!!!!!!!!!!
+    fclose(fp);
     
-    // 次の試行を計算
-    if (last_trial < NUM_TRIALS) {//NUM_TRIALS回未満なら同じパーセンテージで次の試行
-        *start_pct = last_pct;
-        *start_trial = last_trial + 1;
-    } else if (last_pct > END_PERCENTAGE) {//NUM_TRIALS回完了していて、まだEND_PERCENTAGE以上なら次のパーセンテージに移動
+    // 5回分記録されていれば次のパーセンテージへ
+    if (trial_count >= NUM_TRIALS && last_pct > END_PERCENTAGE) {
         *start_pct = last_pct - PERCENTAGE_STEP;
-        *start_trial = 1;
-    } else {//すべて完了済み
+    } else if (trial_count >= NUM_TRIALS && last_pct <= END_PERCENTAGE) {
         printf("All experiments already completed!\n");
         exit(0);
+    } else {
+        // 途中で止まっている場合（通常は起きないはず）
+        *start_pct = last_pct;
     }
     
     return 1;
 }
 
-//引数はCSVに保存する各種データの値
+// 指定パーセンテージの結果を読み取り、5回連続で同じエラー数かチェック
+// 戻り値: 安定していればそのエラー数、不安定なら-1
+int check_previous_stability(int percentage) {
+    FILE *fp = fopen(CSV_FILENAME, "r");
+    if (fp == NULL) {
+        return -1;
+    }
+    
+    char line[512];
+    int error_counts[NUM_TRIALS];
+    int count = 0;
+    
+    // ヘッダー行をスキップ
+    fgets(line, sizeof(line), fp);
+    
+    // 指定パーセンテージのエラー数を集める
+    while (fgets(line, sizeof(line), fp) != NULL && count < NUM_TRIALS) {
+        int pct, trial, err;
+        char result[16];
+        if (sscanf(line, "%d,%d,%15[^,],%d", &pct, &trial, result, &err) >= 4) {
+            if (pct == percentage) {
+                error_counts[count++] = err;
+            }
+        }
+    }
+    
+    fclose(fp);
+    
+    // 5回分のデータがない場合
+    if (count < NUM_TRIALS) {
+        return -1;
+    }
+    
+    // 全て同じ値かチェック
+    int first_val = error_counts[0];
+    for (int i = 1; i < NUM_TRIALS; i++) {
+        if (error_counts[i] != first_val) {
+            return -1; // 不安定
+        }
+    }
+    
+    return first_val; // 安定している場合、そのエラー数を返す
+}
+
+// CSVの直近N行が連続でエラー0(OK)かチェック
+// 戻り値: 連続OK回数
+#define CONSECUTIVE_OK_THRESHOLD 12
+
+int check_consecutive_ok_count(void) {
+    FILE *fp = fopen(CSV_FILENAME, "r");
+    if (fp == NULL) {
+        return 0;
+    }
+    
+    char line[512];
+    // 十分な大きさの配列で全エラー数を保持
+    int *all_errors = malloc(10000 * sizeof(int));
+    if (all_errors == NULL) {
+        fclose(fp);
+        return 0;
+    }
+    int total_count = 0;
+    
+    // ヘッダー行をスキップ
+    fgets(line, sizeof(line), fp);
+    
+    // 全行のエラー数を読み込む
+    while (fgets(line, sizeof(line), fp) != NULL && total_count < 10000) {
+        int pct, trial, err;
+        char result[16];
+        if (sscanf(line, "%d,%d,%15[^,],%d", &pct, &trial, result, &err) >= 4) {
+            all_errors[total_count++] = err;
+        }
+    }
+    
+    fclose(fp);
+    
+    // 後ろから連続0をカウント
+    int consecutive_ok = 0;
+    for (int i = total_count - 1; i >= 0; i--) {
+        if (all_errors[i] == 0) {
+            consecutive_ok++;
+        } else {
+            break;
+        }
+    }
+    
+    free(all_errors);
+    return consecutive_ok;
+}
+
 void append_result(int percentage, int trial, const char *result, 
                    int error_count, int reverse_errors,
                    size_t allocated_mb, size_t allocated_pages,
                    size_t free_mb, double exec_time) {
-    FILE *fp = fopen(CSV_FILENAME, "a");//追記モードで開く
+    FILE *fp = fopen(CSV_FILENAME, "a");
     if (fp == NULL) {
         perror("Failed to open CSV file");
         return;
-    }//各データをCSV形式で書き込む
+    }
     
     fprintf(fp, "%d,%d,%s,%d,%d,%zu,%zu,%zu,%.2f\n",
             percentage, trial, result, error_count, reverse_errors,
-            allocated_mb, allocated_pages, free_mb, exec_time);//各データをCSV形式で書き込む
+            allocated_mb, allocated_pages, free_mb, exec_time);
     
-    fclose(fp);//ファイルを閉じる
+    fclose(fp);
 }
 
+// 5回分まとめてCSVに書き込む
+void append_all_results(int percentage, TrialResult *results, int actual_trials) {
+    for (int i = 0; i < NUM_TRIALS; i++) {
+        int src_idx = (i < actual_trials) ? i : actual_trials - 1; // 足りない分は最後の結果をコピー
+        append_result(percentage, i + 1, results[src_idx].result,
+                     results[src_idx].error_count, results[src_idx].reverse_errors,
+                     results[src_idx].allocated_mb, results[src_idx].allocated_pages,
+                     results[src_idx].free_mb, results[src_idx].exec_time);
+    }
+}
 
-void create_csv_header() {//CSVファイルのヘッダーを作成
+void create_csv_header() {
     FILE *fp = fopen(CSV_FILENAME, "r");
-    if (fp != NULL) {//Not NULLなら既にファイルが存在する
+    if (fp != NULL) {
         fclose(fp);
-        return; // ファイルが既に存在する
+        return;
     }
     
-    fp = fopen(CSV_FILENAME, "w");//新規作成モードで開く
-    if (fp == NULL) {//開けなかった場合
+    fp = fopen(CSV_FILENAME, "w");
+    if (fp == NULL) {
         perror("Failed to create CSV file");
         exit(1);
     }
     
-    fprintf(fp, "percentage,trial,result,error_count,reverse_errors,allocated_mb,allocated_pages,free_memory_mb,execution_time_sec\n");//ヘッダー行を書き込む
-    fclose(fp);//ファイルを閉じる
+    fprintf(fp, "percentage,trial,result,error_count,reverse_errors,allocated_mb,allocated_pages,free_memory_mb,execution_time_sec\n");
+    fclose(fp);
+}
+
+// 1回のテストを実行し、結果をTrialResultに格納
+// 戻り値: 0=成功, -1=失敗(ALLOC_FAILなど)
+int run_single_trial(int percentage, int trial, TrialResult *result) {
+    clock_t start_time = clock();
+    
+    printf("[%d%% #%d] ", percentage, trial);
+    fflush(stdout);
+    
+    struct sysinfo info;
+    if (sysinfo(&info) != 0) {
+        perror("sysinfo failed");
+        return -1;
+    }
+    
+    size_t free_memory = info.freeram * info.mem_unit;
+    size_t alloc_size = (free_memory * percentage) / 100;
+    size_t num_pages = alloc_size / PAGE_SIZE;
+    alloc_size = num_pages * PAGE_SIZE;
+    
+    result->free_mb = free_memory / (1024 * 1024);
+    result->allocated_mb = alloc_size / (1024 * 1024);
+    result->allocated_pages = num_pages;
+    
+    void *memory = malloc(alloc_size);
+    if (memory == NULL) {
+        printf("ALLOC_FAIL\n");
+        result->result = "ALLOC_FAIL";
+        result->error_count = 0;
+        result->reverse_errors = 0;
+        result->exec_time = 0.0;
+        return -1;
+    }
+
+    ErrorRecord *errors = malloc(MAX_ERRORS * sizeof(ErrorRecord));
+    if (errors == NULL) {
+        printf("ERROR_ARRAY_FAIL\n");
+        free(memory);
+        return -1;
+    }
+    
+    // 書き込み
+    for (size_t i = 0; i < num_pages; i++) {
+        void **page = (void **)((char *)memory + i * PAGE_SIZE);
+        *page = page;
+        flush_page(page);
+    }
+    memory_barrier();
+    
+    // スキャン
+    int error_count = 0;
+    for (size_t i = 0; i < num_pages; i++) {
+        void **page = (void **)((char *)memory + i * PAGE_SIZE);
+        flush_page(page);
+        memory_barrier();
+        
+        void *stored_addr = *page;
+        if (stored_addr != page) {
+            if (error_count < MAX_ERRORS) {
+                errors[error_count].actual_addr = page;
+                errors[error_count].read_addr = stored_addr;
+                error_count++;
+            }
+        }
+    }
+    
+    // 逆方向テスト
+    int reverse_errors = 0;
+    if (error_count > 0) {
+        const char *test_pattern = "Is This BadRAM?";
+        size_t pattern_len = strlen(test_pattern) + 1;
+        
+        for (int i = 0; i < error_count; i++) {
+            char *actual = (char *)errors[i].actual_addr;
+            char *read = (char *)errors[i].read_addr;
+
+            if ((void*)read < memory || (void*)read >= (memory + alloc_size)) {
+                continue;
+            }
+            
+            memcpy(actual, test_pattern, pattern_len);
+            flush_page(actual);
+            memory_barrier();
+            flush_page(read);
+            memory_barrier();
+            
+            if (memcmp(read, test_pattern, pattern_len) == 0) {
+                reverse_errors++;
+            }
+        }
+    }
+    
+    clock_t end_time = clock();
+    double exec_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+    
+    // 結果を格納
+    result->result = (error_count > 0) ? "NG" : "OK";
+    result->error_count = error_count;
+    result->reverse_errors = reverse_errors;
+    result->exec_time = exec_time;
+    
+    if (error_count > 0) {
+        printf("NG err=%d rev=%d %.1fs\n", error_count, reverse_errors, exec_time);
+    } else {
+        printf("OK %.1fs\n", exec_time);
+    }
+    
+    free(errors);
+    free(memory);
+    
+    return 0;
 }
 
 int main() {
     
     printf("Memory Test: %d%%-%d%%, %d trials, step %d%%\n", 
            START_PERCENTAGE, END_PERCENTAGE, NUM_TRIALS, PERCENTAGE_STEP);
+    printf("Optimization: skip remaining trials if errors=MAX or errors=0\n");
     
-    // CSV初期化
     create_csv_header();
     
-    // 進捗確認
-    int start_pct, start_trial;
-    int resumed = read_progress(&start_pct, &start_trial);
+    int start_pct;
+    int resumed = read_progress(&start_pct);
     
     if (resumed) {
-        printf("Resuming from %d%% - Trial %d\n", start_pct, start_trial);
+        printf("Resuming from %d%%\n", start_pct);
     }
     
-    // メインループ: START_PERCENTAGEからEND_PERCENTAGEまで、各NUM_TRIALS回ずつ
     for (int percentage = start_pct; percentage >= END_PERCENTAGE; percentage -= PERCENTAGE_STEP) {
-        int start = (percentage == start_pct) ? start_trial : 1;
+        printf("\n=== %d%% ===\n", percentage);
         
-        for (int trial = start; trial <= NUM_TRIALS; trial++) {//各試行
-            clock_t start_time = clock();//時間計測開始!!!
-            
-            printf("[%d%% #%d] ", percentage, trial);
-            fflush(stdout);
-            
-            // ステップ1: 空きメモリの確認
-            struct sysinfo info;//これマジで便利
-            if (sysinfo(&info) != 0) {//失敗した場合
-                perror("sysinfo failed");
-                continue;
+        TrialResult results[NUM_TRIALS];
+        int actual_trials = 0;
+        int found_error = 0;
+        
+        // 前のパーセンテージが安定していたかチェック
+        int prev_pct = percentage + PERCENTAGE_STEP;
+        int prev_stable_errors = -1;
+        if (prev_pct <= START_PERCENTAGE) {
+            prev_stable_errors = check_previous_stability(prev_pct);
+            if (prev_stable_errors >= 0) {
+                printf("  Previous %d%% was stable (err=%d)\n", prev_pct, prev_stable_errors);
             }
-            
-            size_t free_memory = info.freeram * info.mem_unit;
-            size_t alloc_size = (free_memory * percentage) / 100; // 指定された%を使用,percentage%のメモリを確保
-            size_t num_pages = alloc_size / PAGE_SIZE;// ページ数計算
-            
-            // alloc_sizeをPAGE_SIZEの倍数に丸めます,理由はページ単位で確保するためずれると困る
-            alloc_size = num_pages * PAGE_SIZE;
-
-            // ステップ2: メモリの確保 
-            void *memory = malloc(alloc_size);//メモリ確保
-            if (memory == NULL) {//失敗した場合
-                printf("ALLOC_FAIL\n");
-                append_result(percentage, trial, "ALLOC_FAIL", 0, 0,
-                            alloc_size / (1024 * 1024), num_pages,
-                            free_memory / (1024 * 1024), 0.0);//失敗結果をCSVに保存
-                continue;
-            }
-
-            // エラー記録用の配列を確保
-            ErrorRecord *errors = malloc(MAX_ERRORS * sizeof(ErrorRecord));//エラー記録用配列確保
-            if (errors == NULL) {//失敗した場合
-                printf("ERROR_ARRAY_FAIL\n");
-                free(memory);
-                continue;
-            }
-            
-            // ステップ3: 各ページに仮想アドレスを書き込む
-            for (size_t i = 0; i < num_pages; i++) {//ループ開始
-                void **page = (void **)((char *)memory + i * PAGE_SIZE);//ページの先頭アドレスを取得
-                
-                // ページ先頭に自分自身のアドレスを書き込む
-                *page = page;
-                
-                // 書き込み後にページ全体をキャッシュからフラッシュ
-                flush_page(page);
-            }
-            
-            // 全ての書き込みがメモリに反映されるまで待機
-            memory_barrier();//みんな大好きメモリバリア
-            
-            // ステップ4: 各ページをスキャンしてエラーを検出（エイリアス→オリジナル）
-            int error_count = 0;
-            
-            for (size_t i = 0; i < num_pages; i++) {
-                void **page = (void **)((char *)memory + i * PAGE_SIZE);//ページの先頭アドレスを取得
-
-                // 読み出し前にページ全体をキャッシュからフラッシュ
-                flush_page(page);
-                memory_barrier();
-                
-                void *stored_addr = *page; // 書き込んだアドレスを読み出す
-                
-                // 書き込んだアドレスと実際のアドレスが異なる場合
-                if (stored_addr != page) {
-                    // エラーを記録
-                    if (error_count < MAX_ERRORS) {
-                        errors[error_count].actual_addr = page;
-                        errors[error_count].read_addr = stored_addr;
-                        error_count++;
-                    }
-                }
-            }
-            
-            // ステップ5: エラーが見つかった場合、逆方向のテストを実行
-            int reverse_errors = 0;
-            if (error_count > 0) {
-                const char *test_pattern = "Is This BadRAM?";
-                size_t pattern_len = strlen(test_pattern) + 1;
-                
-                for (int i = 0; i < error_count; i++) {
-                    char *actual = (char *)errors[i].actual_addr;
-                    char *read = (char *)errors[i].read_addr;
-
-                    // read addressが確保したメモリ範囲内か一応チェック
-                    // (範囲外のアドレスが読めた場合は、それをテスト対象から外す)
-                    if ((void*)read < memory || (void*)read >= (memory + alloc_size)) {
-                        continue;
-                    }
-                    
-                    // actual addressに文字列を書き込む
-                    memcpy(actual, test_pattern, pattern_len);
-
-                    // 書き込み後にページ全体をキャッシュをフラッシュ
-                    flush_page(actual);
-                    memory_barrier();
-
-                    // read addressのページ全体をキャッシュもフラッシュ
-                    flush_page(read);
-                    memory_barrier();
-                    
-                    // read addressから読み出す
-                    if (memcmp(read, test_pattern, pattern_len) == 0) {
-                        reverse_errors++;
-                    }
-                }
-            }
-            
-            // 実行時間計算
-            clock_t end_time = clock();
-            double exec_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
-            
-            // ステップ6: 結果を表示
-            const char *result;
-            if (error_count > 0) {
-                printf("NG err=%d rev=%d %.1fs\n", error_count, reverse_errors, exec_time);
-                result = "NG";
-            } else {
-                printf("OK %.1fs\n", exec_time);
-                result = "OK";
-            }
-            
-            // CSVに結果を保存
-            append_result(percentage, trial, result, error_count, reverse_errors,
-                         alloc_size / (1024 * 1024), num_pages,
-                         free_memory / (1024 * 1024), exec_time);
-            
-            // 後処理
-            free(errors);
-            free(memory);
         }
+        
+        // 直近の連続OK回数をチェック
+        int consecutive_ok = check_consecutive_ok_count();
+        if (consecutive_ok >= CONSECUTIVE_OK_THRESHOLD) {
+            printf("  Last %d results were OK\n", consecutive_ok);
+        }
+        
+        // 最初の試行
+        if (run_single_trial(percentage, 1, &results[0]) == 0) {
+            actual_trials = 1;
+            
+            if (results[0].error_count >= MAX_ERRORS) {
+                // エラーが上限に達した場合：1回で終了
+                printf("  -> MAX_ERRORS reached, skipping remaining trials\n");
+                append_all_results(percentage, results, actual_trials);
+                continue;
+            }
+            
+            // 前のパーセンテージが安定していて、今回も同じエラー数なら1回で終了
+            if (prev_stable_errors >= 0 && results[0].error_count == prev_stable_errors) {
+                printf("  -> Same as stable previous (%d), skipping remaining trials\n", prev_stable_errors);
+                append_all_results(percentage, results, actual_trials);
+                continue;
+            }
+            
+            // 直近12回以上OKで、今回もOKなら1回で終了
+            if (consecutive_ok >= CONSECUTIVE_OK_THRESHOLD && results[0].error_count == 0) {
+                printf("  -> Consecutive OK (%d+1), skipping remaining trials\n", consecutive_ok);
+                append_all_results(percentage, results, actual_trials);
+                continue;
+            }
+            
+            if (results[0].error_count > 0) {
+                found_error = 1;
+            }
+        } else {
+            // 失敗した場合は5回分記録して次へ
+            actual_trials = 1;
+            append_all_results(percentage, results, actual_trials);
+            continue;
+        }
+        
+        // エラー0件の場合：最大3回まで
+        // エラーあり(1-9999)の場合：5回実行
+        int max_trials_for_zero = 3;
+        
+        for (int trial = 2; trial <= NUM_TRIALS; trial++) {
+            // エラー0件で、まだエラーが見つかっておらず、3回目を超えた場合はスキップ
+            if (!found_error && trial > max_trials_for_zero) {
+                printf("  -> No errors in %d trials, skipping remaining\n", max_trials_for_zero);
+                break;
+            }
+            
+            if (run_single_trial(percentage, trial, &results[actual_trials]) == 0) {
+                actual_trials++;
+                
+                if (results[actual_trials - 1].error_count >= MAX_ERRORS) {
+                    // 途中でMAX_ERRORSに達した場合も終了
+                    printf("  -> MAX_ERRORS reached, skipping remaining trials\n");
+                    break;
+                }
+                
+                if (results[actual_trials - 1].error_count > 0) {
+                    found_error = 1;
+                }
+            }
+        }
+        
+        // CSVに5回分記録
+        append_all_results(percentage, results, actual_trials);
     }
     
-    printf("Done! Results: %s\n", CSV_FILENAME);
+    printf("\nDone! Results: %s\n", CSV_FILENAME);
     
     return 0;
 }
